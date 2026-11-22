@@ -1,9 +1,4 @@
-"""Survivor bot for mechfight/1: placement is what scores, so stay alive.
-- stay inside the zone with margin, prefer the outer part of the next circle (away from the crowd)
-- face every threat (rear hits deal x1.5), strafe to dodge, shoot back with lead
-- grab a second weapon early, pick defensive upgrades, take supply drops when it is safe
-- steer around buildings with a precomputed 2 m height grid, climb with jets when needed
-"""
+"""Mechfight controller: weapon-specific aim, loot growth, and zone-aware fighting."""
 import math, os, random, struct, array
 import mechfight as mf
 
@@ -60,7 +55,7 @@ WEAPON_PRIO = {"laser": 3, "lightning": 2, "mortar": 1, "gun": 0}
 
 
 class Bot:
-    name = "survivor"
+    name = "survivor-v4"
 
     def __init__(self, hello):
         self.cfg = hello["config"]
@@ -82,6 +77,27 @@ class Bot:
         self.last_attacker = None
         self.scan_phase = 0.0
         self.laser_hold = 0.0
+        self.target_id = None
+        self.loot_memory = {}
+
+    def target_height(self, tgt):
+        if tgt.get("kind") == "mech":
+            return self.cfg["mech"].get("height", 9) * (1 + self.cfg["cubes"].get("size_per_cube", .05) * tgt.get("cubes", 0))
+        return self.cfg.get("npc" if tgt.get("kind") == "npc" else "crates", {}).get("height", 3.5 if tgt.get("kind") == "npc" else 2.4)
+
+    def aligned(self, me, command, desired, dist, tgt):
+        # A command applies before the next 20 Hz physics tick. Evaluate the
+        # actual attainable aim, separately for each weapon's trajectory.
+        dt = 1 / self.cfg["match"].get("tick_hz", 20)
+        ay, ap = me["aim"]
+        turn = me["stats"].get("turn_rate", 4) * dt
+        pitch_turn = me["stats"].get("pitch_rate", 3) * dt
+        ay += max(-turn, min(turn, wrap(command[0] - ay)))
+        ap += max(-pitch_turn, min(pitch_turn, command[1] - ap))
+        radius = (self.cfg["mech"].get("radius", 2.5) * (1 + .05 * tgt.get("cubes", 0))
+                  if tgt.get("kind") == "mech" else 1.4)
+        return (abs(wrap(ay - desired[0])) < math.atan2(radius * .85, max(dist, 1))
+                and abs(ap - desired[1]) < math.atan2(self.target_height(tgt) * .35, max(dist, 1)))
 
     # ---------- geometry ----------
     def zone_now(self, z, t):
@@ -137,7 +153,7 @@ class Bot:
         mx, my, mz = me["pos"]
         mz += me["stats"].get("muzzle_height", 7)
         tx, ty, tz = tgt["pos"]
-        tz += {"mech": 4.5, "npc": 1.75, "crate": 1.2}.get(tgt.get("kind"), 2.0)
+        tz += self.target_height(tgt) / 2
         vx, vy, vz = tgt.get("vel", [0, 0, 0])
         t = 0.0
         for _ in range(3):
@@ -151,7 +167,7 @@ class Bot:
         disc = v2 * v2 - g * (g * dist * dist + 2 * dz * v2)
         if disc < 0:
             return None
-        return math.atan((v2 + math.sqrt(disc)) / (g * dist))  # high arc: lobs over cover
+        return math.atan((v2 - math.sqrt(disc)) / (g * max(dist, .01)))
 
     # ---------- main ----------
     def act(self, obs):
@@ -160,6 +176,12 @@ class Bot:
         x, y, z = me["pos"]
         act = {"tick": obs["tick"]}
         G = self.grid
+        for p in obs.get("pickups", []):
+            self.loot_memory[p["id"]] = (p, t)
+        for ev in obs.get("events", []):
+            if ev.get("type") in ("took", "take_failed"):
+                self.loot_memory.pop(ev.get("id"), None)
+        self.loot_memory = {pid: (p, seen) for pid, (p, seen) in self.loot_memory.items() if t - seen < 15}
 
         # upgrades
         if obs.get("offer"):
@@ -190,16 +212,16 @@ class Bot:
         for m in mechs:
             if m["_d"] > 230:
                 continue
-            vis = G is None or G.los(eye, [m["pos"][0], m["pos"][1], m["pos"][2] + 4.5])
+            vis = G is None or G.los(eye, [m["pos"][0], m["pos"][1], m["pos"][2] + self.target_height(m) / 2])
             hpm = m.get("hp", 1400) / max(m.get("max_hp", 1400), 1)
-            score = m["_d"] + 120 * hpm - (60 if m["id"] == self.last_attacker else 0) - (80 if not vis else 0) * -1
+            score = m["_d"] + 160 * hpm - (35 if m["id"] == self.last_attacker else 0) + (500 if not vis else 0) - (35 if m["id"] == self.target_id else 0)
             cands.append((score, m, vis))
         npc_attacker = self.last_attacker is not None and self.last_attacker >= 100 and t - self.last_hit_t < 3
         for m in npcs:
             if npc_attacker and m["id"] == self.last_attacker and m["_d"] < 120:
                 vis = G is None or G.los(eye, [m["pos"][0], m["pos"][1], m["pos"][2] + 1.75])
                 cands.append((m["_d"] + 300, m, vis))
-        if not cands and hp_frac > 0.55:
+        if not any(c[2] for c in cands) and hp_frac > 0.55:
             for m in npcs:
                 if m["_d"] < 110:
                     vis = G is None or G.los(eye, [m["pos"][0], m["pos"][1], m["pos"][2] + 1.75])
@@ -209,13 +231,14 @@ class Bot:
                 for c in obs.get("crates", []):
                     dd = math.dist(c["pos"][:2], (x, y))
                     if dd < 60 and abs(c["pos"][2] - z) < 12:
-                        cc = {"id": c["id"], "kind": "crate", "pos": [c["pos"][0], c["pos"][1], c["pos"][2] - 0.55], "vel": [0, 0, 0], "_d": dd}
+                        cc = {"id": c["id"], "kind": "crate", "pos": c["pos"], "vel": [0, 0, 0], "_d": dd}
                         vis = G is None or G.los(eye, [c["pos"][0], c["pos"][1], c["pos"][2] + 1.2])
                         if vis:
                             cands.append((dd + 800, cc, vis))
         if cands:
             cands.sort(key=lambda c: c[0])
             target, tvis = cands[0][1], cands[0][2]
+            self.target_id = target["id"]
 
         # ---------- weapons ----------
         weps = me["weapons"]
@@ -228,6 +251,7 @@ class Bot:
                     gun_speed = w["stats"].get("speed", 252)
             yaw, pitch, dist = self.lead(me, target, gun_speed)
             dyaw, dpitch, _ = self.lead(me, target, 1e9)
+            gun_aim = (yaw, pitch)
             laser_ready = any(w and w["kind"] == "laser" and w.get("charge", 0) >= w["stats"].get("charge", 0.75) - 0.12 for w in weps)
             if laser_ready:
                 yaw, pitch = dyaw, dpitch
@@ -235,13 +259,13 @@ class Bot:
             ay, ap = me["aim"]
             yerr = abs(wrap(ay - yaw)); perr = abs(ap - pitch)
             tol = max(0.012, math.atan2(2.0, max(dist, 1)))
-            aimed = yerr < tol and perr < 0.06
+            aimed = self.aligned(me, (yaw, pitch), (dyaw, dpitch), dist, target)
             for i, w in enumerate(weps):
                 if not w:
                     continue
                 k = w["kind"]
                 if k == "gun":
-                    if tvis and aimed and dist < w["stats"].get("range", 230) and w.get("ammo", 1) > 0:
+                    if tvis and self.aligned(me, (yaw, pitch), gun_aim, dist, target) and dist < w["stats"].get("range", 230) and w.get("ammo", 1) > 0:
                         fire[i] = True
                 elif k == "laser":
                     full = w["stats"].get("charge", 0.75)
@@ -251,22 +275,31 @@ class Bot:
                         if ch < full - 0.02:
                             fire[i] = True  # keep charging
                         else:
-                            fire[i] = not (aimed or yerr < 0.02)  # release when on target
-                    elif ch > 0 and ch < full:
+                            fire[i] = not aimed  # both axes must intersect the target
+                    elif ch > 0:
                         fire[i] = True
                 elif k == "lightning":
                     cone = math.radians(w["stats"].get("cone_deg", 30)) / 2
-                    if dist < w["stats"].get("range", 45) * 0.95 and yerr < cone and me["energy"] > 10 and tvis:
+                    if dist < w["stats"].get("range", 45) * 0.95 and abs(wrap(ay - dyaw)) < cone and me["energy"] > w["stats"].get("energy", 3) and tvis:
                         fire[i] = True
                 elif k == "mortar":
                     if 35 < dist < 220 and w["cooldown"] <= 0:
                         v = w["stats"].get("speed", 72); g = w["stats"].get("gravity", 22)
-                        dz = target["pos"][2] - (z + me["stats"].get("height", 9) + 0.5)
-                        p = self.mortar_pitch(target["_d"], dz, v, g)
+                        flight = target["_d"] / v
+                        for _ in range(3):
+                            tv = target.get("vel", [0, 0, 0])
+                            dx = target["pos"][0] + tv[0] * flight - x
+                            dy = target["pos"][1] + tv[1] * flight - y
+                            dz = target["pos"][2] + self.target_height(target) / 2 - (z + me["stats"].get("height", 9) + 0.5)
+                            p = self.mortar_pitch(math.hypot(dx, dy), dz, v, g)
+                            if p is None:
+                                break
+                            flight = math.hypot(dx, dy) / max(v * math.cos(p), 1)
                         if p is not None and p < self.cfg["mech"].get("max_pitch", 1.3):
                             if not any(fire):  # only lob when gun is not firing this tick
                                 aim_pitch = p
-                                if abs(ap - p) < 0.05 and yerr < 0.04:
+                                aim_yaw = math.atan2(dy, dx)
+                                if self.aligned(me, (aim_yaw, p), (aim_yaw, p), dist, target):
                                     fire[i] = True
             if me["weapons"][0] and me["weapons"][0]["kind"] == "gun" and me["weapons"][0].get("ammo", 12) == 0:
                 act["reload"] = True
@@ -317,18 +350,20 @@ class Bot:
                         break
 
         # loot: second weapon / better weapon
-        if mode in ("hold", "to-next") and (target is None or target["kind"] != "mech" or target["_d"] > 150):
+        if mode in ("hold", "to-next"):
             have = {w["kind"] for w in weps if w}
             slot1 = weps[1]
             cur = WEAPON_PRIO.get(slot1["kind"], 0) if slot1 else -1
             best = None
-            for p in obs.get("pickups", []):
+            for p, seen in self.loot_memory.values():
                 if p["kind"] in have:
                     continue
                 pr = WEAPON_PRIO.get(p["kind"], 0)
                 if pr <= cur:
                     continue
                 dd = math.dist(p["pos"][:2], (x, y))
+                if target is not None and target["kind"] == "mech" and target["_d"] < 70 and dd > 18:
+                    continue
                 if dd > (140 if slot1 is None else 70) or abs(p["pos"][2] - z) > 25:
                     continue
                 if math.dist(p["pos"][:2], nc) > nr + 20 and mode != "hold":
@@ -346,14 +381,29 @@ class Bot:
                     mode = "loot"
                     move_yaw = math.atan2(p["pos"][1] - y, p["pos"][0] - x)
                     speed = 1.0 if dd > 8 else 0.5
+                    boost = dd > 25 and me["energy"] > 65 and (target is None or target.get("kind") != "mech")
 
         # cubes nearby: free HP
         if mode in ("hold", "to-next") and obs.get("cubes"):
-            cb = min(obs["cubes"], key=lambda c: math.dist(c["pos"][:2], (x, y)))
+            reachable_cubes = [c for c in obs["cubes"] if abs(c["pos"][2] - z) < 4 and math.dist(c["pos"][:2], zc) < zr - 5]
+            cb = min(reachable_cubes, key=lambda c: math.dist(c["pos"][:2], (x, y)), default=None)
+            if cb is None:
+                cb = {"pos": [x + 10000, y, z]}
             dd = math.dist(cb["pos"][:2], (x, y))
-            if dd < 70 and (target is None or target["kind"] != "mech" or target["_d"] > 110):
+            if dd < 70 and (dd < 18 or target is None or target["kind"] != "mech" or target["_d"] > 65):
                 mode = "cube"
                 move_yaw = math.atan2(cb["pos"][1] - y, cb["pos"][0] - x)
+
+        # Search the arena instead of waiting at an empty spawn. A complete
+        # sweep reveals loot outside the initial 120-degree vision wedge.
+        if mode == "hold" and target is None:
+            mode = "explore"
+            phase = t * .22 + me["id"] * 1.7
+            roam_radius = min(nr * .45, 90)
+            gx = nc[0] + math.cos(phase * .18) * roam_radius
+            gy = nc[1] + math.sin(phase * .18) * roam_radius
+            move_yaw = math.atan2(gy - y, gx - x)
+            aim_yaw = wrap(phase)
 
         # ---------- combat movement ----------
         if target is not None and target["kind"] == "mech":
@@ -365,6 +415,8 @@ class Bot:
             side = ty + self.strafe_dir * math.pi / 2
             want_far = hp_frac < 0.35 or (target.get("hp", 0) > me["hp"] * 1.6)
             pref = 150 if want_far else 90
+            if not want_far and any(w and w["kind"] == "lightning" for w in weps):
+                pref = next(w["stats"].get("range", 45) * .72 for w in weps if w and w["kind"] == "lightning")
             # short-range weapon users: keep away from lightning (45 m)
             if "lightning" in target.get("weapons", []):
                 pref = max(pref, 70)
@@ -374,8 +426,8 @@ class Bot:
                 boost = me["energy"] > 25
             elif d < pref - 25:
                 radial = -0.8
-            elif d > pref + 60 and not want_far and mode == "hold":
-                radial = 0.4
+            elif d > pref + 15 and not want_far and mode == "hold":
+                radial = 1.1
             mx = math.cos(side) + radial * math.cos(ty)
             my_ = math.sin(side) + radial * math.sin(ty)
             cyaw = math.atan2(my_, mx)
@@ -383,8 +435,9 @@ class Bot:
                 move_yaw = cyaw
             else:
                 # blend zone goal with dodging
-                bx = math.cos(move_yaw) * 1.4 + math.cos(side) * 0.8
-                by = math.sin(move_yaw) * 1.4 + math.sin(side) * 0.8
+                dodge_weight = 0.15 if mode in ("cube", "loot", "drop") else 0.8
+                bx = math.cos(move_yaw) * 1.4 + math.cos(side) * dodge_weight
+                by = math.sin(move_yaw) * 1.4 + math.sin(side) * dodge_weight
                 move_yaw = math.atan2(by, bx)
             # incoming laser telegraph: dodge hard
             if target.get("charging"):
@@ -457,7 +510,7 @@ class Bot:
                 if snd:
                     near = min(snd, key=lambda s: {"near": 0, "mid": 1, "far": 2}[s["dist"]])
                     aim_yaw = near["bearing"]
-                elif mode in ("hold",):
+                elif mode in ("hold", "explore"):
                     self.scan_phase += 0.1
                     base = math.atan2(nc[1] - y, nc[0] - x) + math.pi if d_next > 20 else 0.0
                     aim_yaw = base + math.sin(self.scan_phase * 0.6) * 1.6
@@ -472,4 +525,5 @@ class Bot:
         return act
 
 
-mf.run(Bot)
+if __name__ == "__main__":
+    mf.run(Bot)
