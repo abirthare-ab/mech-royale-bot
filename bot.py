@@ -1,5 +1,5 @@
 """Mechfight controller: weapon-specific aim, loot growth, and zone-aware fighting."""
-import math, os, random, struct, array
+import math, os, random, struct, array, time
 import mechfight as mf
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -55,7 +55,7 @@ WEAPON_PRIO = {"laser": 3, "lightning": 2, "mortar": 1, "gun": 0}
 
 
 class Bot:
-    name = "survivor-v5"
+    name = "survivor-v6"
 
     def __init__(self, hello):
         self.cfg = hello["config"]
@@ -79,6 +79,163 @@ class Bot:
         self.laser_hold = 0.0
         self.target_id = None
         self.loot_memory = {}
+        self.last_damage_t = -99.0
+        self.last_combat_t = -99.0
+        self.healing = False
+        self.cover_goal = None
+        self.cover_search_at = 0.0
+        self.recent_threats = {}
+
+    def choose_upgrade(self, choices, me):
+        """Marginal idealized DPS/EHP, with modest utility fallback scores.
+
+        These are a selection heuristic, not predictions of match win rate.
+        All weapon gains use their current upgraded stats, so diminishing
+        magazine and charge benefits are handled without a fixed ordering.
+        """
+        weapons = {w['kind']: w['stats'] for w in me['weapons'] if w}
+        dps = {}
+        for kind, stats in weapons.items():
+            damage, cooldown = stats.get('damage', 0), stats.get('cooldown', 1)
+            if kind == 'gun':
+                dps[kind] = damage * stats.get('mag', 12) / max(.01, cooldown * stats.get('mag', 12) + stats.get('reload', 2.4))
+            elif kind == 'laser':
+                dps[kind] = damage / max(.01, cooldown + stats.get('charge', .75))
+            elif kind == 'mortar':
+                # Don't assume every shell earns direct hit plus splash.
+                dps[kind] = damage / max(.01, cooldown)
+            else:
+                dps[kind] = damage / max(.01, cooldown)
+        total = max(sum(dps.values()), .01)
+        values = {'plating': .15, 'armor': .08 / max(.01, 1 - me['stats'].get('armor', 0) - .08),
+                  'nanites': .055, 'servos': .05, 'gun_velocity': .05,
+                  'lightning_range': .06, 'lightning_efficiency': .08,
+                  'reactor': .035, 'capacitor': .035, 'jets': .03,
+                  'sensors': .025, 'gyros': .025, 'mortar_splash': .04,
+                  'mortar_velocity': .035, 'laser_pierce': .015, 'lightning_chain': .015}
+        if 'gun' in weapons:
+            s = weapons['gun']; m, c, r = s['mag'], s['cooldown'], s['reload']
+            fraction = dps['gun'] / total
+            values['gun_mag'] = fraction * ((m + 8) * (m * c + r) / (m * ((m + 8) * c + .8 * r)) - 1)
+            values['gun_damage'] = fraction * .15
+            values['gun_rate'] = fraction * ((m * c + r) / (m * c * .87 + r) - 1)
+        if 'laser' in weapons:
+            s = weapons['laser']; q, c = s['charge'], s['cooldown']
+            fraction = dps['laser'] / total
+            values['laser_damage'] = fraction * .18
+            values['laser_charge'] = fraction * ((q + c) / (.75 * q + c) - 1)
+        if 'mortar' in weapons:
+            values['mortar_reload'] = dps['mortar'] / total * (1 / .82 - 1)
+        return max(range(len(choices)), key=lambda i: (values.get(choices[i]['id'], 0), -i))
+
+    def covered_at(self, position, me, threats):
+        if self.grid is None:
+            return False
+        for enemy in threats:
+            origin = list(enemy['pos'])
+            origin[2] += self.target_height(enemy) * .8
+            for height in (me['stats'].get('height', 9) / 2, me['stats'].get('eye_height', 8)):
+                point = [position[0], position[1], position[2] + height]
+                if self.grid.los(origin, point):
+                    return False
+        return True
+
+    def recovery_zone_safe(self, point, obs, zc, zr):
+        # Recovery takes at least five seconds: never choose a destination
+        # already outside the announced next circle, even during its hold.
+        margin = max(12, obs['self']['stats'].get('radius', 2.5) + 3)
+        zone = obs['zone']
+        return (math.dist(point[:2], zc) <= zr - margin and
+                math.dist(point[:2], zone['next_center']) <= zone['next_radius'] - margin)
+
+    def reachable_cover(self, point, obs, zc, zr, threats):
+        me = obs['self']
+        if self.grid is None or not self.recovery_zone_safe(point, obs, zc, zr):
+            return False
+        x, y, z = me['pos']
+        distance = math.dist(point[:2], (x, y))
+        if distance > 22 or abs(point[2] - z) > 1.2:
+            return False
+        dx, dy = (point[0] - x) / max(distance, .001), (point[1] - y) / max(distance, .001)
+        radius = me['stats'].get('radius', 2.5)
+        # Include the endpoint; spacing <= 1 m cannot skip a narrow obstacle
+        # represented by the grid. Recheck after every movement/steering step.
+        steps = max(1, math.ceil(distance))
+        for i in range(1, steps + 1):
+            d = distance * i / steps
+            for side in (-radius, 0, radius):
+                px, py = x + dx * d - dy * side, y + dy * d + dx * side
+                if self.blocked(px, py, z) or abs(self.grid.ground(px, py) - z) > 1.2:
+                    return False
+        return self.covered_at(point, me, threats)
+
+    def healing_goal(self, obs, zc, zr, mode):
+        """Return (goal, protected) only when recovery is presently feasible."""
+        me, now = obs['self'], obs['t']
+        visible_ids = {actor['id'] for actor in obs['mechs']}
+        for actor in obs['mechs']:
+            self.recent_threats[actor['id']] = (now, dict(actor))
+        delay = self.cfg['mech'].get('regen_delay', 5)
+        self.recent_threats = {i: v for i, v in self.recent_threats.items() if now - v[0] <= delay}
+        hp = me['hp'] / max(1, me['max_hp'])
+        if hp >= .85 or not me.get('in_zone', True) or mode in ('zone!', 'to-next', 'center', 'drop'):
+            self.healing = False
+            self.cover_goal = None
+            return None
+        if hp < .50:
+            self.healing = True
+        if not self.healing:
+            return None
+        threats = list(obs['mechs'])
+        # A close hunter can erase a five-second recovery window almost at
+        # once. Do not abandon shooting or loot for speculative cover then.
+        if any(math.dist(e['pos'][:2], me['pos'][:2]) < 65 for e in threats):
+            self.cover_goal = None
+            return None
+        # Losing vision of a pursuing opponent is not evidence it left.
+        # Veto recovery if an unseen recent actor could already be close.
+        for actor_id, (seen_t, actor) in self.recent_threats.items():
+            if actor_id not in visible_ids:
+                possible_speed = max(self.cfg['mech']['boost_speed'], math.hypot(*actor.get('vel', [0, 0])[:2]))
+                if math.dist(actor['pos'][:2], me['pos'][:2]) - possible_speed * (now - seen_t + delay) < 65:
+                    self.cover_goal = None
+                    return None
+        near_sound = any(s.get('dist') == 'near' and s.get('kind') in
+                         ('gun', 'laser', 'laser_charge', 'mortar', 'lightning', 'npc_gun', 'explosion')
+                         for s in obs.get('sounds', []))
+        if not threats:
+            if not near_sound and now - self.last_damage_t > 1.5 and self.recovery_zone_safe(me['pos'], obs, zc, zr):
+                return me['pos'], True
+            return None
+        if (self.covered_at(me['pos'], me, threats) and not near_sound
+                and now - self.last_damage_t > 1.5 and self.recovery_zone_safe(me['pos'], obs, zc, zr)):
+            return me['pos'], True
+        if self.grid is None:
+            return None
+        if self.cover_goal is not None:
+            if math.dist(self.cover_goal[:2], me['pos'][:2]) < 2 or not self.reachable_cover(self.cover_goal, obs, zc, zr, threats):
+                self.cover_goal = None
+            else:
+                return self.cover_goal, False
+        if now < self.cover_search_at:
+            return None
+        self.cover_search_at = now + .7
+        x, y, z = me['pos']
+        nearest = min(threats, key=lambda e: math.dist(e['pos'][:2], me['pos'][:2]))
+        away = math.atan2(y - nearest['pos'][1], x - nearest['pos'][0])
+        deadline = time.perf_counter() + .003
+        for distance in (10, 18):
+            for offset in (0, -.7, .7, -1.4, 1.4, math.pi):
+                if time.perf_counter() > deadline:
+                    return None
+                yaw = away + offset
+                dx, dy = math.cos(yaw), math.sin(yaw)
+                px, py = x + dx * distance, y + dy * distance
+                point = [px, py, self.grid.ground(px, py)]
+                if self.reachable_cover(point, obs, zc, zr, threats):
+                    self.cover_goal = point
+                    return point, False
+        return None
 
     def target_height(self, tgt):
         if tgt.get("kind") == "mech":
@@ -230,12 +387,14 @@ class Bot:
 
         # upgrades
         if obs.get("offer"):
-            ch = [c["id"] for c in obs["offer"]["choices"]]
-            best = min(range(len(ch)), key=lambda i: UPGRADE_PRIO.index(ch[i]) if ch[i] in UPGRADE_PRIO else 99)
-            act["pick"] = best
+            act["pick"] = self.choose_upgrade(obs['offer']['choices'], me)
 
         # remember who hurt us
         for ev in obs.get("events", []):
+            if ev.get('type') in ('hit', 'damaged'):
+                self.last_combat_t = t
+            if ev.get('type') == 'damaged':
+                self.last_damage_t = t
             if ev.get("type") == "damaged" and ev.get("bearing") is not None:
                 self.last_hit_bearing = ev["bearing"]; self.last_hit_t = t; self.last_attacker = ev.get("by")
 
@@ -373,8 +532,10 @@ class Bot:
             mode = "center"
             move_yaw = math.atan2(nc[1] - y, nc[0] - x)
 
+        # Once zone movement is required, loot must not overwrite its goal.
+        # Supply drops, weapons and cubes are considered only in hold mode.
         # supply drop
-        if mode == "hold" or mode == "to-next":
+        if mode == "hold":
             for dr in obs.get("drops", []):
                 dd = math.dist(dr["pos"][:2], (x, y))
                 in_next = math.dist(dr["pos"][:2], nc) < nr
@@ -390,7 +551,7 @@ class Bot:
                         break
 
         # loot: second weapon / better weapon
-        if mode in ("hold", "to-next"):
+        if mode == "hold":
             have = {w["kind"] for w in weps if w}
             slot1 = weps[1]
             cur = WEAPON_PRIO.get(slot1["kind"], 0) if slot1 else -1
@@ -423,8 +584,8 @@ class Bot:
                     speed = 1.0 if dd > 8 else 0.5
                     boost = dd > 25 and me["energy"] > 65 and (target is None or target.get("kind") != "mech")
 
-        # cubes nearby: free HP
-        if mode in ("hold", "to-next") and obs.get("cubes"):
+        # Cubes grant HP/damage below the stat cap and upgrade progress above it.
+        if mode == "hold" and obs.get("cubes"):
             reachable_cubes = [c for c in obs["cubes"] if abs(c["pos"][2] - z) < 4 and math.dist(c["pos"][:2], zc) < zr - 5]
             cb = min(reachable_cubes, key=lambda c: math.dist(c["pos"][:2], (x, y)), default=None)
             if cb is None:
@@ -503,6 +664,30 @@ class Bot:
                     move_yaw = math.atan2(ry, rx)
                 else:
                     move_yaw = math.atan2(math.sin(move_yaw) + ry, math.cos(move_yaw) + rx)
+
+        # Disengage only toward reachable cover, and keep firing while crossing
+        # open ground. Once protected, stop damage (including crate farming)
+        # so the game's regeneration timer can actually complete.
+        recovery = self.healing_goal(obs, zc, zr, mode)
+        if recovery is not None:
+            goal, protected = recovery
+            if protected:
+                mode = 'heal'
+                move_yaw = None
+                speed = 0.0
+                boost = False
+                fire = [False, False]
+            else:
+                mode = 'cover'
+                move_yaw = math.atan2(goal[1] - y, goal[0] - x)
+                speed = 1.0
+                boost = me['energy'] > 40
+                # Releasing fires the beam; it does NOT cancel the shot. A
+                # discharge may reset regeneration via a later hit event,
+                # but removes the charge's half-speed movement immediately.
+                for slot, weapon in enumerate(weps):
+                    if weapon and weapon['kind'] == 'laser':
+                        fire[slot] = False
 
         # ---------- steering / stuck handling ----------
         jump = False
