@@ -55,7 +55,7 @@ WEAPON_PRIO = {"laser": 3, "lightning": 2, "mortar": 1, "gun": 0}
 
 
 class Bot:
-    name = "survivor-v4"
+    name = "survivor-v5"
 
     def __init__(self, hello):
         self.cfg = hello["config"]
@@ -124,9 +124,11 @@ class Bot:
             off = (k // 2 + (k % 2)) * (math.pi / 12) * (1 if k % 2 == 0 else -1)
             yaw = want_yaw + off
             cs, sn = math.cos(yaw), math.sin(yaw)
+            radius = me['stats'].get('radius', self.cfg['mech'].get('radius', 2.5))
             free = True
             for d in (3.5, 6.0, 9.0):
-                if self.blocked(x + cs * d, y + sn * d, z):
+                if any(self.blocked(x + cs * d - sn * side, y + sn * d + cs * side, z)
+                       for side in (-radius, 0, radius)):
                     free = False
                     break
             if free:
@@ -168,6 +170,49 @@ class Bot:
         if disc < 0:
             return None
         return math.atan((v2 - math.sqrt(disc)) / (g * max(dist, .01)))
+
+    def mortar_solution(self, me, target, weapon):
+        """Predict moving-target intercept and reject arcs blocked by terrain."""
+        v = weapon['stats'].get('speed', 72)
+        g = weapon['stats'].get('gravity', 22)
+        x, y, z = me['pos']
+        z += me['stats'].get('height', 9) + .5
+        tv = target.get('vel', [0, 0, 0])
+        for high in (False, True):
+            flight = target['_d'] / v
+            for _ in range(5):
+                dx = target['pos'][0] + tv[0] * flight - x
+                dy = target['pos'][1] + tv[1] * flight - y
+                dz = target['pos'][2] + self.target_height(target) / 2 - z
+                d = math.hypot(dx, dy)
+                disc = v ** 4 - g * (g * d * d + 2 * dz * v * v)
+                if disc < 0 or d < 1:
+                    break
+                p = math.atan((v * v + (1 if high else -1) * math.sqrt(disc)) / (g * d))
+                flight = d / max(v * math.cos(p), .01)
+            else:
+                if not me['stats'].get('min_pitch', -.7) <= p <= me['stats'].get('max_pitch', 1.3):
+                    continue
+                if flight >= weapon['stats'].get('ttl', 7):
+                    continue
+                yaw = math.atan2(dy, dx)
+                blocked = False
+                if self.grid:
+                    # Ignore the first few metres occupied by our barrel and
+                    # the target's final cylinder, as in straight-shot LOS.
+                    for j in range(1, max(2, int(d / 4))):
+                        tm = flight * j / max(2, int(d / 4))
+                        dist = v * math.cos(p) * tm
+                        if dist < 4 or d - dist < 3:
+                            continue
+                        px, py = x + math.cos(yaw) * dist, y + math.sin(yaw) * dist
+                        pz = z + v * math.sin(p) * tm - .5 * g * tm * tm
+                        if self.grid.top(px, py) > pz:
+                            blocked = True
+                            break
+                if not blocked:
+                    return yaw, p, math.hypot(d, dz)
+        return None
 
     # ---------- main ----------
     def act(self, obs):
@@ -227,7 +272,7 @@ class Bot:
                     vis = G is None or G.los(eye, [m["pos"][0], m["pos"][1], m["pos"][2] + 1.75])
                     if vis:
                         cands.append((m["_d"] + 500, m, vis))
-            if not cands:
+            if not any(c[2] for c in cands):
                 for c in obs.get("crates", []):
                     dd = math.dist(c["pos"][:2], (x, y))
                     if dd < 60 and abs(c["pos"][2] - z) < 12:
@@ -236,7 +281,7 @@ class Bot:
                         if vis:
                             cands.append((dd + 800, cc, vis))
         if cands:
-            cands.sort(key=lambda c: c[0])
+            cands.sort(key=lambda c: (not c[2], c[0]))
             target, tvis = cands[0][1], cands[0][2]
             self.target_id = target["id"]
 
@@ -253,8 +298,18 @@ class Bot:
             dyaw, dpitch, _ = self.lead(me, target, 1e9)
             gun_aim = (yaw, pitch)
             laser_ready = any(w and w["kind"] == "laser" and w.get("charge", 0) >= w["stats"].get("charge", 0.75) - 0.12 for w in weps)
+            mortar_plan = None
+            if not any(w and w['kind'] == 'laser' and w.get('charge', 0) > 0 for w in weps):
+                for wi, w in enumerate(weps):
+                    if w and w['kind'] == 'mortar' and w['cooldown'] <= 0 and target['_d'] > 35:
+                        solution = self.mortar_solution(me, target, w)
+                        if solution is not None:
+                            mortar_plan = wi, solution
+                            break
             if laser_ready:
                 yaw, pitch = dyaw, dpitch
+            elif mortar_plan is not None:
+                yaw, pitch = mortar_plan[1][:2]
             aim_yaw, aim_pitch = yaw, pitch
             ay, ap = me["aim"]
             yerr = abs(wrap(ay - yaw)); perr = abs(ap - pitch)
@@ -283,24 +338,9 @@ class Bot:
                     if dist < w["stats"].get("range", 45) * 0.95 and abs(wrap(ay - dyaw)) < cone and me["energy"] > w["stats"].get("energy", 3) and tvis:
                         fire[i] = True
                 elif k == "mortar":
-                    if 35 < dist < 220 and w["cooldown"] <= 0:
-                        v = w["stats"].get("speed", 72); g = w["stats"].get("gravity", 22)
-                        flight = target["_d"] / v
-                        for _ in range(3):
-                            tv = target.get("vel", [0, 0, 0])
-                            dx = target["pos"][0] + tv[0] * flight - x
-                            dy = target["pos"][1] + tv[1] * flight - y
-                            dz = target["pos"][2] + self.target_height(target) / 2 - (z + me["stats"].get("height", 9) + 0.5)
-                            p = self.mortar_pitch(math.hypot(dx, dy), dz, v, g)
-                            if p is None:
-                                break
-                            flight = math.hypot(dx, dy) / max(v * math.cos(p), 1)
-                        if p is not None and p < self.cfg["mech"].get("max_pitch", 1.3):
-                            if not any(fire):  # only lob when gun is not firing this tick
-                                aim_pitch = p
-                                aim_yaw = math.atan2(dy, dx)
-                                if self.aligned(me, (aim_yaw, p), (aim_yaw, p), dist, target):
-                                    fire[i] = True
+                    if mortar_plan is not None and mortar_plan[0] == i and not laser_ready:
+                        myaw, mpitch, mdist = mortar_plan[1]
+                        fire[i] = self.aligned(me, (yaw, pitch), (myaw, mpitch), mdist, target)
             if me["weapons"][0] and me["weapons"][0]["kind"] == "gun" and me["weapons"][0].get("ammo", 12) == 0:
                 act["reload"] = True
         else:
@@ -338,7 +378,7 @@ class Bot:
             for dr in obs.get("drops", []):
                 dd = math.dist(dr["pos"][:2], (x, y))
                 in_next = math.dist(dr["pos"][:2], nc) < nr
-                if dd < 160 and dr["lands_in"] < dd / 12 + 2 and in_next and hp_frac > 0.45:
+                if dd < 160 and dr["lands_in"] < dd / 12 + 2 and in_next:
                     contested = any(math.dist(m["pos"][:2], dr["pos"][:2]) < 70 for m in mechs)
                     if not contested and (dr["holder"] in (None, me["id"])):
                         mode = "drop"
@@ -415,18 +455,21 @@ class Bot:
             side = ty + self.strafe_dir * math.pi / 2
             want_far = hp_frac < 0.35 or (target.get("hp", 0) > me["hp"] * 1.6)
             pref = 150 if want_far else 90
-            if not want_far and any(w and w["kind"] == "lightning" for w in weps):
-                pref = next(w["stats"].get("range", 45) * .72 for w in weps if w and w["kind"] == "lightning")
-            # short-range weapon users: keep away from lightning (45 m)
-            if "lightning" in target.get("weapons", []):
+            using_lightning = not want_far and any(w and w["kind"] == "lightning" for w in weps)
+            if using_lightning:
+                pref = next(w["stats"].get("range", 45) * .70 for w in weps if w and w["kind"] == "lightning")
+            # Keep laser builds outside an opponent's shorting range. A build
+            # carrying lightning must enter its own range to use both weapons.
+            if "lightning" in target.get("weapons", []) and not using_lightning:
                 pref = max(pref, 70)
+            radial_band = 5 if using_lightning else 15
             radial = 0.0
             if hp_frac < 0.3:
                 radial = -1.0
                 boost = me["energy"] > 25
-            elif d < pref - 25:
+            elif d < pref - radial_band:
                 radial = -0.8
-            elif d > pref + 15 and not want_far and mode == "hold":
+            elif d > pref + radial_band and not want_far and mode == "hold":
                 radial = 1.1
             mx = math.cos(side) + radial * math.cos(ty)
             my_ = math.sin(side) + radial * math.sin(ty)
