@@ -1,7 +1,5 @@
-# survivor — Mech Royale bot (Builders Buildathon 2026)
+# Mech Royale v7: crossfire movement
 
-A survival-first bot for the `mechfight/1` 16-mech battle royale. Placement scores, so it stays in the zone,
-faces threats, dodges, and shoots back with lead.
+Based on the submitted v6 bot (score 4.46). During ordinary combat against multiple visible opponents, consider seven nearby movement directions to move away from secondary attackers and charging laser lines, rejecting blocked or unsafe-zone routes.
 
-Sources: `mechfight.py` is the official kit wrapper (unchanged). `grid.bin` is a 2 m height grid built from the
-kit's `arena/v2` map by `build_grid.py`. Everything else was written during the Buildathon. MIT licensed.
+This candidate has no measured competition score yet. Scenario tests and the official recorded-stream checker do not establish match strength. Terrain geometry remains approximate.

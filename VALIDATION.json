@@ -1,0 +1,25 @@
+{
+  "version": "survivor-v7",
+  "baseline_score": 4.46,
+  "candidate_score": null,
+  "scenario_and_regression_checks_passed": 43,
+  "official_observations": 300,
+  "on_time": 300,
+  "late": 0,
+  "malformed": 0,
+  "wrong_tick": 0,
+  "latency_ms": {
+    "p50": 0.6,
+    "p90": 0.6,
+    "p99": 0.9,
+    "max": 2.6
+  },
+  "limitations": "Recorded observations do not react to actions. These checks do not measure match strength or predict leaderboard score. Geometry remains approximate.",
+  "files_sha256": {
+    "mechfight.py": "62fbcc3eeb63a64baeebcba0a8b101ca9f520c6100061b54147a5b62f45e2719",
+    "grid.bin": "ca4233a39a3f6e965c70cdcb69717de9e5b569d77307ddd2d8a51c1ceb915409",
+    "Dockerfile": "6e349cf6f498711e452931e4f63f6c34e8ccc2b7ddc53bc72a14d889d84e30df",
+    "README.md": "ff1f7e5f96a7c3ef3e112dfd20e321848c13c1ac6c8c2c7d81d7d016ee8846a6",
+    "bot.py": "d865276c86359a11ac39fe1ad4564d06c6f060eaab1f3b21ca97ff95e0adc8dc"
+  }
+}

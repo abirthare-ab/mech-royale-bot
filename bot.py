@@ -55,7 +55,7 @@ WEAPON_PRIO = {"laser": 3, "lightning": 2, "mortar": 1, "gun": 0}
 
 
 class Bot:
-    name = "survivor-v6"
+    name = "survivor-v7"
 
     def __init__(self, hello):
         self.cfg = hello["config"]
@@ -236,6 +236,75 @@ class Bot:
                     self.cover_goal = point
                     return point, False
         return None
+
+    def crossfire_heading(self, me, actors, target, yaw, speed, boost, zone_center, zone_radius):
+        """Bounded local movement adjustment; no opponent or match simulator.
+
+        Preserve single-opponent movement. With crossfire, compare seven
+        nearby headings for secondary-threat clearance and current laser
+        lines. Aim, firing, inventory and strategic destination stay intact.
+        """
+        if len(actors) < 2 or target is None:
+            return yaw
+        x, y, z = me['pos']
+        radius = me['stats'].get('radius', 2.5)
+        height = me['stats'].get('height', 9)
+        relevant = []
+        for enemy in actors:
+            distance = math.dist(enemy['pos'][:2], (x, y))
+            if distance > 280:
+                continue
+            if self.grid is not None:
+                origin = list(enemy['pos'])
+                origin[2] += self.target_height(enemy) * .8
+                if not self.grid.los(origin, [x, y, z + height / 2]):
+                    continue
+            relevant.append((enemy, distance))
+        if len(relevant) < 2:
+            return yaw
+        velocity = me['stats'].get('boost_speed' if boost else 'walk_speed', 19.5 if boost else 11.7) * speed
+        if any(w and w['kind'] == 'laser' and w.get('charge', 0) > 0 for w in me['weapons']):
+            velocity *= self.cfg['mech'].get('charge_move_mult', .5)
+        best = None
+        for offset in (0, -.45, .45, -.9, .9, -1.35, 1.35):
+            heading = yaw + offset
+            ux, uy = math.cos(heading), math.sin(heading)
+            # Short forecast only: current laser direction can change later.
+            points = [(x + ux * velocity * t, y + uy * velocity * t) for t in (.25, .5, .75)]
+            if any(math.dist(point, zone_center) > zone_radius - radius - 2 for point in points):
+                continue
+            if self.grid is not None:
+                blocked = False
+                steps = max(1, math.ceil(velocity * .75))
+                for k in range(1, steps + 1):
+                    d = velocity * .75 * k / steps
+                    if any(self.blocked(x + ux*d - uy*r, y + uy*d + ux*r, z)
+                           for r in (-radius, 0, radius)):
+                        blocked = True
+                        break
+                if blocked:
+                    continue
+            # Penalize deviations so a harmless second observer does not
+            # change established movement merely by existing.
+            score = .35 * (offset / .9) ** 2
+            for enemy, distance in relevant:
+                ex, ey, ez = enemy['pos']
+                end_distance = math.dist(points[-1], (ex, ey))
+                if enemy['id'] != target['id'] and distance < 90:
+                    score += 2 * max(0, (90-distance)/90) * (distance-end_distance) / 10
+                if enemy.get('charging'):
+                    ay, ap = enemy['aim']
+                    ax, ay_ = math.cos(ay), math.sin(ay)
+                    origin_z = ez + self.target_height(enemy) * self.cfg['mech'].get('muzzle_height', 7) / self.cfg['mech'].get('height', 9)
+                    for px, py in points:
+                        along = (px-ex)*ax + (py-ey)*ay_
+                        across = abs((px-ex)*ay_ - (py-ey)*ax)
+                        beam_z = origin_z + math.tan(ap)*along
+                        if 0 < along < 280 and z - 1 <= beam_z <= z + height + 1:
+                            score += 3 * max(0, 1 - across/(radius+2))
+            if best is None or score < best[0] - 1e-9:
+                best = score, heading
+        return yaw if best is None else best[1]
 
     def target_height(self, tgt):
         if tgt.get("kind") == "mech":
@@ -688,6 +757,11 @@ class Bot:
                 for slot, weapon in enumerate(weps):
                     if weapon and weapon['kind'] == 'laser':
                         fire[slot] = False
+
+        # Only local combat movement is adjustable. Zone travel, pickups,
+        # healing and cover escape keep their established priorities.
+        if mode == 'fight' and move_yaw is not None:
+            move_yaw = self.crossfire_heading(me, mechs, target, move_yaw, speed, boost, zc, zr)
 
         # ---------- steering / stuck handling ----------
         jump = False
