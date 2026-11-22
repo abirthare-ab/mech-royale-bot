@@ -1,25 +1,60 @@
 {
-  "version": "survivor-v7",
-  "baseline_score": 4.46,
-  "candidate_score": null,
-  "scenario_and_regression_checks_passed": 43,
-  "official_observations": 300,
-  "on_time": 300,
-  "late": 0,
-  "malformed": 0,
-  "wrong_tick": 0,
-  "latency_ms": {
-    "p50": 0.6,
-    "p90": 0.6,
-    "p99": 0.9,
-    "max": 2.6
+  "name": "survivor-v8",
+  "baseline": "survivor-v6",
+  "baseline_practice_score": 4.46,
+  "candidate_practice_score": null,
+  "claimed_above_7": false,
+  "unit_tests": {
+    "combat_regression": 13,
+    "v6_regression": 22,
+    "new_combat": 8,
+    "native_geometry": 11,
+    "projectile_evasion": 14,
+    "total": 68,
+    "passed": 68
   },
-  "limitations": "Recorded observations do not react to actions. These checks do not measure match strength or predict leaderboard score. Geometry remains approximate.",
-  "files_sha256": {
+  "official_checker": {
+    "platform": "linux/amd64",
+    "cpus": 1,
+    "memory_mb": 512,
+    "network": "none",
+    "read_only": true,
+    "uid": 65534,
+    "observations": 300,
+    "ontime": 300,
+    "late": 0,
+    "wrong_tick": 0,
+    "bad_lines": 0,
+    "ready_ms": 289,
+    "p50_ms": 1.0,
+    "p90_ms": 1.9,
+    "p99_ms": 4.5,
+    "max_ms": 5.6
+  },
+  "stress": {
+    "cases": 400,
+    "enemies_per_case": 15,
+    "projectiles_per_case": 24,
+    "platform": "linux/amd64 under Colima on Mac",
+    "cpus": 1,
+    "memory_mb": 512,
+    "p50_ms": 13.7901665,
+    "p99_ms": 23.792679,
+    "max_ms": 30.107377,
+    "over50": 0
+  },
+  "limitations": [
+    "No reactive official matches run locally; candidate placement is unknown.",
+    "Evasion uses bounded wall-clock search; exact decisions may vary with available CPU time.",
+    "Recorded checker does not respond to actions.",
+    "Local model tests do not validate all server physics."
+  ],
+  "sha256": {
+    "evasion.py": "424b02aa238922984eb685903c9000fbeb4faa2a9e489df3f310844bf13423b4",
     "mechfight.py": "62fbcc3eeb63a64baeebcba0a8b101ca9f520c6100061b54147a5b62f45e2719",
-    "grid.bin": "ca4233a39a3f6e965c70cdcb69717de9e5b569d77307ddd2d8a51c1ceb915409",
-    "Dockerfile": "6e349cf6f498711e452931e4f63f6c34e8ccc2b7ddc53bc72a14d889d84e30df",
-    "README.md": "ff1f7e5f96a7c3ef3e112dfd20e321848c13c1ac6c8c2c7d81d7d016ee8846a6",
-    "bot.py": "d865276c86359a11ac39fe1ad4564d06c6f060eaab1f3b21ca97ff95e0adc8dc"
+    "Dockerfile": "ff90198ce0731431bf95c51eb7297803af82e92fab564bddc5343ab593d0c505",
+    "README.md": "69a7183b627b7069e230465ac48ad05f8359071405d79c9d48d8f51e3f5a23bd",
+    "bot.py": "005c5b4ddb92ff1e1f27916049e36e11e6ec70cdbc458d5b3afa9bc357b015f0",
+    "geometry.py": "253e7a3da602609bbf8d78b81d49d5edacc00cb6b7ed47da356c2258ad64103e"
   }
 }

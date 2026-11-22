@@ -5,42 +5,8 @@ import mechfight as mf
 HERE = os.path.dirname(os.path.abspath(__file__))
 
 
-class Grid:
-    def __init__(self, path):
-        with open(path, "rb") as f:
-            magic, self.x0, self.y0, self.c, _, self.w, self.h = struct.unpack("<4sffffii", f.read(28))
-            n = self.w * self.h
-            self.g = array.array("h"); self.g.frombytes(f.read(2 * n))
-            self.t = array.array("h"); self.t.frombytes(f.read(2 * n))
-
-    def idx(self, x, y):
-        i = int((x - self.x0) / self.c); j = int((y - self.y0) / self.c)
-        if i < 0 or j < 0 or i >= self.w or j >= self.h:
-            return -1
-        return j * self.w + i
-
-    def top(self, x, y):
-        k = self.idx(x, y)
-        return 999.0 if k < 0 else self.t[k] / 100.0
-
-    def ground(self, x, y):
-        k = self.idx(x, y)
-        return 0.0 if k < 0 else self.g[k] / 100.0
-
-    def los(self, a, b, step=2.0, skip=4.0):
-        dx, dy, dz = b[0] - a[0], b[1] - a[1], b[2] - a[2]
-        d = math.hypot(dx, dy)
-        if d < 1e-6:
-            return True
-        n = int(d / step)
-        for s in range(n + 1):
-            f = s * step / d
-            if f * d < skip or (1 - f) * d < 3.0:
-                continue
-            x = a[0] + dx * f; y = a[1] + dy * f; z = a[2] + dz * f
-            if self.top(x, y) > z:
-                return False
-        return True
+from geometry import Grid
+from evasion import evade
 
 
 def wrap(a):
@@ -55,13 +21,13 @@ WEAPON_PRIO = {"laser": 3, "lightning": 2, "mortar": 1, "gun": 0}
 
 
 class Bot:
-    name = "survivor-v7"
+    name = "survivor-v8"
 
     def __init__(self, hello):
         self.cfg = hello["config"]
         random.seed(hello.get("seed", 1))
         try:
-            self.grid = Grid(os.path.join(HERE, "grid.bin"))
+            self.grid = Grid(os.path.join(HERE, "grid.bin"), map_dir=hello.get("map", {}).get("dir"))
         except Exception as e:
             mf.log("grid load failed", e)
             self.grid = None
@@ -84,6 +50,8 @@ class Bot:
         self.healing = False
         self.cover_goal = None
         self.cover_search_at = 0.0
+        self.body_height = self.cfg["mech"].get("height", 9)
+        self.body_radius = self.cfg["mech"].get("radius", 2.5)
         self.recent_threats = {}
 
     def choose_upgrade(self, choices, me):
@@ -175,7 +143,7 @@ class Bot:
         visible_ids = {actor['id'] for actor in obs['mechs']}
         for actor in obs['mechs']:
             self.recent_threats[actor['id']] = (now, dict(actor))
-        delay = self.cfg['mech'].get('regen_delay', 5)
+        delay = me['stats'].get('regen_delay', self.cfg['mech'].get('regen_delay', 5))
         self.recent_threats = {i: v for i, v in self.recent_threats.items() if now - v[0] <= delay}
         hp = me['hp'] / max(1, me['max_hp'])
         if hp >= .85 or not me.get('in_zone', True) or mode in ('zone!', 'to-next', 'center', 'drop'):
@@ -237,79 +205,22 @@ class Bot:
                     return point, False
         return None
 
-    def crossfire_heading(self, me, actors, target, yaw, speed, boost, zone_center, zone_radius):
-        """Bounded local movement adjustment; no opponent or match simulator.
-
-        Preserve single-opponent movement. With crossfire, compare seven
-        nearby headings for secondary-threat clearance and current laser
-        lines. Aim, firing, inventory and strategic destination stay intact.
-        """
-        if len(actors) < 2 or target is None:
-            return yaw
-        x, y, z = me['pos']
-        radius = me['stats'].get('radius', 2.5)
-        height = me['stats'].get('height', 9)
-        relevant = []
-        for enemy in actors:
-            distance = math.dist(enemy['pos'][:2], (x, y))
-            if distance > 280:
-                continue
-            if self.grid is not None:
-                origin = list(enemy['pos'])
-                origin[2] += self.target_height(enemy) * .8
-                if not self.grid.los(origin, [x, y, z + height / 2]):
-                    continue
-            relevant.append((enemy, distance))
-        if len(relevant) < 2:
-            return yaw
-        velocity = me['stats'].get('boost_speed' if boost else 'walk_speed', 19.5 if boost else 11.7) * speed
-        if any(w and w['kind'] == 'laser' and w.get('charge', 0) > 0 for w in me['weapons']):
-            velocity *= self.cfg['mech'].get('charge_move_mult', .5)
-        best = None
-        for offset in (0, -.45, .45, -.9, .9, -1.35, 1.35):
-            heading = yaw + offset
-            ux, uy = math.cos(heading), math.sin(heading)
-            # Short forecast only: current laser direction can change later.
-            points = [(x + ux * velocity * t, y + uy * velocity * t) for t in (.25, .5, .75)]
-            if any(math.dist(point, zone_center) > zone_radius - radius - 2 for point in points):
-                continue
-            if self.grid is not None:
-                blocked = False
-                steps = max(1, math.ceil(velocity * .75))
-                for k in range(1, steps + 1):
-                    d = velocity * .75 * k / steps
-                    if any(self.blocked(x + ux*d - uy*r, y + uy*d + ux*r, z)
-                           for r in (-radius, 0, radius)):
-                        blocked = True
-                        break
-                if blocked:
-                    continue
-            # Penalize deviations so a harmless second observer does not
-            # change established movement merely by existing.
-            score = .35 * (offset / .9) ** 2
-            for enemy, distance in relevant:
-                ex, ey, ez = enemy['pos']
-                end_distance = math.dist(points[-1], (ex, ey))
-                if enemy['id'] != target['id'] and distance < 90:
-                    score += 2 * max(0, (90-distance)/90) * (distance-end_distance) / 10
-                if enemy.get('charging'):
-                    ay, ap = enemy['aim']
-                    ax, ay_ = math.cos(ay), math.sin(ay)
-                    origin_z = ez + self.target_height(enemy) * self.cfg['mech'].get('muzzle_height', 7) / self.cfg['mech'].get('height', 9)
-                    for px, py in points:
-                        along = (px-ex)*ax + (py-ey)*ay_
-                        across = abs((px-ex)*ay_ - (py-ey)*ax)
-                        beam_z = origin_z + math.tan(ap)*along
-                        if 0 < along < 280 and z - 1 <= beam_z <= z + height + 1:
-                            score += 3 * max(0, 1 - across/(radius+2))
-            if best is None or score < best[0] - 1e-9:
-                best = score, heading
-        return yaw if best is None else best[1]
-
     def target_height(self, tgt):
         if tgt.get("kind") == "mech":
             return self.cfg["mech"].get("height", 9) * (1 + self.cfg["cubes"].get("size_per_cube", .05) * tgt.get("cubes", 0))
         return self.cfg.get("npc" if tgt.get("kind") == "npc" else "crates", {}).get("height", 3.5 if tgt.get("kind") == "npc" else 2.4)
+
+    def visible_point(self, origin, target):
+        """Aim at an exposed part of the cylinder, not through a low wall."""
+        height = self.target_height(target)
+        for fraction in (.5, .82, .25):
+            offset = height * fraction
+            point = [target['pos'][0], target['pos'][1], target['pos'][2] + offset]
+            if self.grid is None or self.grid.los(origin, point):
+                target['_aim_height'] = offset
+                return True
+        target['_aim_height'] = height / 2
+        return False
 
     def aligned(self, me, command, desired, dist, tgt):
         # A command applies before the next 20 Hz physics tick. Evaluate the
@@ -323,7 +234,7 @@ class Bot:
         radius = (self.cfg["mech"].get("radius", 2.5) * (1 + .05 * tgt.get("cubes", 0))
                   if tgt.get("kind") == "mech" else 1.4)
         return (abs(wrap(ay - desired[0])) < math.atan2(radius * .85, max(dist, 1))
-                and abs(ap - desired[1]) < math.atan2(self.target_height(tgt) * .35, max(dist, 1)))
+                and abs(ap - desired[1]) < math.atan2(min(self.target_height(tgt) * .35, tgt.get("_aim_height", self.target_height(tgt)/2) * .85, (self.target_height(tgt) - tgt.get("_aim_height", self.target_height(tgt)/2)) * .85), max(dist, 1)))
 
     # ---------- geometry ----------
     def zone_now(self, z, t):
@@ -338,6 +249,8 @@ class Bot:
     def blocked(self, x, y, z):
         if self.grid is None:
             return False
+        if hasattr(self.grid, "body_blocked"):
+            return self.grid.body_blocked(x, y, z, 0, self.body_height, self.cfg["mech"].get("step_up", 1.2))
         return self.grid.top(x, y) - z > 1.3
 
     def steer(self, me, want_yaw, speed_frac=1.0):
@@ -353,8 +266,14 @@ class Bot:
             radius = me['stats'].get('radius', self.cfg['mech'].get('radius', 2.5))
             free = True
             for d in (3.5, 6.0, 9.0):
-                if any(self.blocked(x + cs * d - sn * side, y + sn * d + cs * side, z)
-                       for side in (-radius, 0, radius)):
+                if hasattr(self.grid, 'body_blocked'):
+                    blocked = self.grid.body_blocked(x + cs*d, y + sn*d, z, radius,
+                                                       me['stats'].get('height', 9),
+                                                       me['stats'].get('step_up', 1.2))
+                else:
+                    blocked = any(self.blocked(x + cs*d - sn*side, y + sn*d + cs*side, z)
+                                  for side in (-radius, 0, radius))
+                if blocked:
                     free = False
                     break
             if free:
@@ -373,7 +292,10 @@ class Bot:
         x, y, z = me["pos"]
         h = 0.0
         for d in (3.5, 6.0, 9.0, 14.0):
-            h = max(h, self.grid.top(x + math.cos(yaw) * d, y + math.sin(yaw) * d) - z)
+            px, py = x + math.cos(yaw)*d, y + math.sin(yaw)*d
+            top = (self.grid.obstacle_top(px, py, z, me['stats'].get('height', 9))
+                   if hasattr(self.grid, 'obstacle_top') else self.grid.top(px, py))
+            h = max(h, top-z)
         return h
 
     # ---------- aiming ----------
@@ -381,7 +303,7 @@ class Bot:
         mx, my, mz = me["pos"]
         mz += me["stats"].get("muzzle_height", 7)
         tx, ty, tz = tgt["pos"]
-        tz += self.target_height(tgt) / 2
+        tz += tgt.get("_aim_height", self.target_height(tgt) / 2)
         vx, vy, vz = tgt.get("vel", [0, 0, 0])
         t = 0.0
         for _ in range(3):
@@ -398,51 +320,68 @@ class Bot:
         return math.atan((v2 - math.sqrt(disc)) / (g * max(dist, .01)))
 
     def mortar_solution(self, me, target, weapon):
-        """Predict moving-target intercept and reject arcs blocked by terrain."""
+        """Solve constant-velocity intercept including the forward tube offset."""
         v = weapon['stats'].get('speed', 72)
         g = weapon['stats'].get('gravity', 22)
-        x, y, z = me['pos']
-        z += me['stats'].get('height', 9) + .5
+        origin = list(me['pos'])
+        origin[2] += me['stats'].get('height', 9) + .5
+        offset = me['stats'].get('radius', 2.5) + .5
         tv = target.get('vel', [0, 0, 0])
-        for high in (False, True):
-            flight = target['_d'] / v
-            for _ in range(5):
-                dx = target['pos'][0] + tv[0] * flight - x
-                dy = target['pos'][1] + tv[1] * flight - y
-                dz = target['pos'][2] + self.target_height(target) / 2 - z
-                d = math.hypot(dx, dy)
-                disc = v ** 4 - g * (g * d * d + 2 * dz * v * v)
-                if disc < 0 or d < 1:
-                    break
-                p = math.atan((v * v + (1 if high else -1) * math.sqrt(disc)) / (g * d))
-                flight = d / max(v * math.cos(p), .01)
-            else:
-                if not me['stats'].get('min_pitch', -.7) <= p <= me['stats'].get('max_pitch', 1.3):
-                    continue
-                if flight >= weapon['stats'].get('ttl', 7):
-                    continue
-                yaw = math.atan2(dy, dx)
-                blocked = False
-                if self.grid:
-                    # Ignore the first few metres occupied by our barrel and
-                    # the target's final cylinder, as in straight-shot LOS.
-                    for j in range(1, max(2, int(d / 4))):
-                        tm = flight * j / max(2, int(d / 4))
-                        dist = v * math.cos(p) * tm
-                        if dist < 4 or d - dist < 3:
-                            continue
-                        px, py = x + math.cos(yaw) * dist, y + math.sin(yaw) * dist
-                        pz = z + v * math.sin(p) * tm - .5 * g * tm * tm
-                        if self.grid.top(px, py) > pz:
-                            blocked = True
-                            break
-                if not blocked:
-                    return yaw, p, math.hypot(d, dz)
+        delta = [target['pos'][i] - origin[i] for i in range(3)]
+        delta[2] += target.get('_aim_height', self.target_height(target)/2)
+        def vector(t):
+            return (delta[0] + tv[0]*t, delta[1] + tv[1]*t,
+                    delta[2] + tv[2]*t + .5*g*t*t)
+        def residual(t):
+            q = vector(t)
+            return sum(c*c for c in q) - (offset+v*t)**2
+        ttl = weapon['stats'].get('ttl', 7)
+        previous_t, previous_f = 0., residual(0.)
+        # Each sign crossing gives the low or high arc; avoid accepting
+        # an unconverged fixed-point iterate as a firing solution.
+        for j in range(1, 81):
+            end = ttl*j/80
+            value = residual(end)
+            if value*previous_f <= 0:
+                lo, hi, flo = previous_t, end, previous_f
+                for _ in range(24):
+                    mid = (lo+hi)/2
+                    fm = residual(mid)
+                    if fm*flo > 0:
+                        lo, flo = mid, fm
+                    else:
+                        hi = mid
+                flight = (lo+hi)/2
+                q = vector(flight)
+                norm = math.sqrt(sum(c*c for c in q))
+                yaw = math.atan2(q[1], q[0])
+                pitch = math.atan2(q[2], math.hypot(q[0], q[1]))
+                if (flight > 0 and flight < ttl and
+                    me['stats'].get('min_pitch', -.7) <= pitch <= me['stats'].get('max_pitch', 1.3)):
+                    direction = [c/norm for c in q]
+                    start = [origin[k] + offset*direction[k] for k in range(3)]
+                    clear = self.grid is None or self.grid.los(origin, start, skip=0)
+                    if self.grid is not None and clear:
+                        segments = max(2, math.ceil(v*flight/3))
+                        last = start
+                        for k in range(1, segments+1):
+                            tm = flight*k/segments
+                            point = [start[i] + v*direction[i]*tm for i in range(3)]
+                            point[2] -= .5*g*tm*tm
+                            if not self.grid.los(last, point, skip=0):
+                                clear = False
+                                break
+                            last = point
+                    if clear:
+                        return yaw, pitch, math.sqrt(sum(c*c for c in delta))
+            previous_t, previous_f = end, value
         return None
 
     # ---------- main ----------
     def act(self, obs):
         me = obs["self"]
+        self.body_height = me["stats"].get("height", self.cfg["mech"].get("height", 9))
+        self.body_radius = me["stats"].get("radius", self.cfg["mech"].get("radius", 2.5))
         t = obs["t"]
         x, y, z = me["pos"]
         act = {"tick": obs["tick"]}
@@ -482,22 +421,23 @@ class Bot:
         target = None
         eye = [x, y, z + me["stats"].get("muzzle_height", 7)]
         cands = []
+        target_range = max([230] + [w["stats"].get("range", 230) for w in me["weapons"] if w])
         for m in mechs:
-            if m["_d"] > 230:
+            if m["_d"] > target_range:
                 continue
-            vis = G is None or G.los(eye, [m["pos"][0], m["pos"][1], m["pos"][2] + self.target_height(m) / 2])
+            vis = self.visible_point(eye, m)
             hpm = m.get("hp", 1400) / max(m.get("max_hp", 1400), 1)
             score = m["_d"] + 160 * hpm - (35 if m["id"] == self.last_attacker else 0) + (500 if not vis else 0) - (35 if m["id"] == self.target_id else 0)
             cands.append((score, m, vis))
         npc_attacker = self.last_attacker is not None and self.last_attacker >= 100 and t - self.last_hit_t < 3
         for m in npcs:
             if npc_attacker and m["id"] == self.last_attacker and m["_d"] < 120:
-                vis = G is None or G.los(eye, [m["pos"][0], m["pos"][1], m["pos"][2] + 1.75])
+                vis = self.visible_point(eye, m)
                 cands.append((m["_d"] + 300, m, vis))
         if not any(c[2] for c in cands) and hp_frac > 0.55:
             for m in npcs:
                 if m["_d"] < 110:
-                    vis = G is None or G.los(eye, [m["pos"][0], m["pos"][1], m["pos"][2] + 1.75])
+                    vis = self.visible_point(eye, m)
                     if vis:
                         cands.append((m["_d"] + 500, m, vis))
             if not any(c[2] for c in cands):
@@ -505,7 +445,7 @@ class Bot:
                     dd = math.dist(c["pos"][:2], (x, y))
                     if dd < 60 and abs(c["pos"][2] - z) < 12:
                         cc = {"id": c["id"], "kind": "crate", "pos": c["pos"], "vel": [0, 0, 0], "_d": dd}
-                        vis = G is None or G.los(eye, [c["pos"][0], c["pos"][1], c["pos"][2] + 1.2])
+                        vis = self.visible_point(eye, cc)
                         if vis:
                             cands.append((dd + 800, cc, vis))
         if cands:
@@ -523,7 +463,7 @@ class Bot:
                 if w and w["kind"] == "gun":
                     gun_speed = w["stats"].get("speed", 252)
             yaw, pitch, dist = self.lead(me, target, gun_speed)
-            dyaw, dpitch, _ = self.lead(me, target, 1e9)
+            dyaw, dpitch, direct_dist = self.lead(me, target, 1e9)
             gun_aim = (yaw, pitch)
             laser_ready = any(w and w["kind"] == "laser" and w.get("charge", 0) >= w["stats"].get("charge", 0.75) - 0.12 for w in weps)
             mortar_plan = None
@@ -542,7 +482,7 @@ class Bot:
             ay, ap = me["aim"]
             yerr = abs(wrap(ay - yaw)); perr = abs(ap - pitch)
             tol = max(0.012, math.atan2(2.0, max(dist, 1)))
-            aimed = self.aligned(me, (yaw, pitch), (dyaw, dpitch), dist, target)
+            aimed = self.aligned(me, (yaw, pitch), (dyaw, dpitch), direct_dist, target)
             for i, w in enumerate(weps):
                 if not w:
                     continue
@@ -553,17 +493,18 @@ class Bot:
                 elif k == "laser":
                     full = w["stats"].get("charge", 0.75)
                     ch = w.get("charge", 0)
-                    if w["cooldown"] <= 0 and tvis and dist < w["stats"].get("range", 280):
+                    if w["cooldown"] <= 0 and tvis and direct_dist < w["stats"].get("range", 280):
                         # hitscan: aim straight at the target (no lead)
                         if ch < full - 0.02:
                             fire[i] = True  # keep charging
                         else:
                             fire[i] = not aimed  # both axes must intersect the target
                     elif ch > 0:
-                        fire[i] = True
+                        # Release a blocked charge to recover full movement.
+                        fire[i] = False
                 elif k == "lightning":
                     cone = math.radians(w["stats"].get("cone_deg", 30)) / 2
-                    if dist < w["stats"].get("range", 45) * 0.95 and abs(wrap(ay - dyaw)) < cone and me["energy"] > w["stats"].get("energy", 3) and tvis:
+                    if direct_dist < w["stats"].get("range", 45) * 0.95 and abs(wrap(ay - dyaw)) < cone and me["energy"] > w["stats"].get("energy", 3) and tvis:
                         fire[i] = True
                 elif k == "mortar":
                     if mortar_plan is not None and mortar_plan[0] == i and not laser_ready:
@@ -758,11 +699,6 @@ class Bot:
                     if weapon and weapon['kind'] == 'laser':
                         fire[slot] = False
 
-        # Only local combat movement is adjustable. Zone travel, pickups,
-        # healing and cover escape keep their established priorities.
-        if mode == 'fight' and move_yaw is not None:
-            move_yaw = self.crossfire_heading(me, mechs, target, move_yaw, speed, boost, zc, zr)
-
         # ---------- steering / stuck handling ----------
         jump = False
         vel = me["vel"]
@@ -791,6 +727,11 @@ class Bot:
                     self.stuck_t = 0.0
         if boost and me["energy"] < 15 and d_zone < zr - 6:
             boost = False
+
+        # Correct only imminent observed projectile collisions; preserve the
+        # strategic route otherwise. Do not interrupt an active climb.
+        if not jump and t >= self.climb_until and mode not in ('heal', 'drop'):
+            move_yaw, boost = evade(self, obs, move_yaw, speed, boost, zc, zr)
 
         if move_yaw is not None:
             act["move"] = [math.cos(move_yaw) * speed, math.sin(move_yaw) * speed]

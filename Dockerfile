@@ -1,5 +1,5 @@
 FROM python:3.13-slim@sha256:e48f59cdba69a3cbd9ed2cf0f348d90d45a8d350d98134cf1070bc106ee9ed90
 WORKDIR /bot
-COPY bot.py mechfight.py grid.bin /bot/
+COPY bot.py mechfight.py geometry.py evasion.py /bot/
 ENV PYTHONDONTWRITEBYTECODE=1
 ENTRYPOINT ["python3", "-u", "/bot/bot.py"]
