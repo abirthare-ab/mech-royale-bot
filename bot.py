@@ -187,8 +187,12 @@ class Bot:
         target = None
         eye = [x, y, z + me["stats"].get("muzzle_height", 7)]
         cands = []
+        recent_hit = t - self.last_hit_t < 4
         for m in mechs:
-            if m["_d"] > 230:
+            attacker = recent_hit and m["id"] == self.last_attacker
+            close = m["_d"] < (70 if hp_frac > 0.5 else 45)
+            late_game = obs["alive"] <= 3
+            if m["_d"] > 230 or not (attacker or close or late_game or m.get("hp", 1400) < 250):
                 continue
             vis = G is None or G.los(eye, [m["pos"][0], m["pos"][1], m["pos"][2] + 4.5])
             hpm = m.get("hp", 1400) / max(m.get("max_hp", 1400), 1)
@@ -273,7 +277,7 @@ class Bot:
             mode = "zone!"
             move_yaw = math.atan2(nc[1] - y, nc[0] - x) if d_next < d_zone else math.atan2(zc[1] - y, zc[0] - x)
             boost = True
-        elif d_next > nr - margin_next * 0.2 and (shrink_soon or d_next > nr):
+        elif d_next > nr * 0.72 and (shrink_soon or d_next > nr):
             mode = "to-next"
             move_yaw = math.atan2(nc[1] - y, nc[0] - x)
             # time pressure: boost if the circle will close on us
@@ -311,7 +315,7 @@ class Bot:
                 if pr <= cur:
                     continue
                 dd = math.dist(p["pos"][:2], (x, y))
-                if dd > 90 or abs(p["pos"][2] - z) > 25:
+                if dd > 55 or abs(p["pos"][2] - z) > 15:
                     continue
                 if math.dist(p["pos"][:2], nc) > nr + 20 and mode != "hold":
                     continue
@@ -337,6 +341,36 @@ class Bot:
                 mode = "cube"
                 move_yaw = math.atan2(cb["pos"][1] - y, cb["pos"][0] - x)
 
+        # ---------- evade: stay unseen, let others fight ----------
+        threats = [m for m in mechs if m["_d"] < 220 and (target is None or m["id"] != target["id"])]
+        tx_ = ty_ = 0.0
+        for m in threats:
+            w_ = (220 - m["_d"]) / 220 + 0.3
+            tx_ += (x - m["pos"][0]) / max(m["_d"], 1) * w_
+            ty_ += (y - m["pos"][1]) / max(m["_d"], 1) * w_
+        for sd in obs.get("sounds", []):
+            if sd["kind"] in ("gun", "laser", "lightning", "explosion", "mortar", "step", "boost", "jet", "laser_charge") and sd["dist"] in ("near", "mid") and sd["age"] < 0.6:
+                w_ = 0.8 if sd["dist"] == "near" else 0.35
+                tx_ -= math.cos(sd["bearing"]) * w_
+                ty_ -= math.sin(sd["bearing"]) * w_
+        if (tx_ or ty_) and target is None and mode in ("hold", "to-next", "cube", "loot", "center"):
+            fy = math.atan2(ty_, tx_)
+            if mode == "hold" or mode == "cube" or mode == "loot":
+                move_yaw = fy
+                mode = "evade"
+            else:
+                move_yaw = math.atan2(math.sin(move_yaw) * 1.5 + math.sin(fy), math.cos(move_yaw) * 1.5 + math.cos(fy))
+            # never evade out of the safe circle: slide along it instead
+            px, py = x + math.cos(move_yaw) * 25, y + math.sin(move_yaw) * 25
+            lim = nr * (0.85 if not late else 0.6)
+            if math.hypot(px - nc[0], py - nc[1]) > lim:
+                inward = math.atan2(nc[1] - y, nc[0] - x)
+                a1, a2 = inward + math.pi / 2, inward - math.pi / 2
+                move_yaw = a1 if abs(wrap(a1 - move_yaw)) < abs(wrap(a2 - move_yaw)) else a2
+                if math.hypot(x - nc[0], y - nc[1]) > lim:
+                    move_yaw = math.atan2(math.sin(move_yaw) + math.sin(inward) * 1.5, math.cos(move_yaw) + math.cos(inward) * 1.5)
+            boost = boost or (threats and min(m["_d"] for m in threats) < 90 and me["energy"] > 40)
+
         # ---------- combat movement ----------
         if target is not None and target["kind"] == "mech":
             ty = math.atan2(target["pos"][1] - y, target["pos"][0] - x)
@@ -351,7 +385,9 @@ class Bot:
             if "lightning" in target.get("weapons", []):
                 pref = max(pref, 70)
             radial = 0.0
-            if d < pref - 25:
+            if want_far:
+                radial = -1.0
+            elif d < pref - 25:
                 radial = -0.8
             elif d > pref + 60 and not want_far and mode == "hold":
                 radial = 0.4
@@ -424,6 +460,10 @@ class Bot:
         act["jump"] = jump
 
         # ---------- aim / look ----------
+        if aim_yaw is None and mechs:
+            nm = min(mechs, key=lambda m: m["_d"])
+            aim_yaw = math.atan2(nm["pos"][1] - y, nm["pos"][0] - x)
+            aim_pitch = 0.0
         if aim_yaw is None:
             if t - self.last_hit_t < 3 and self.last_hit_bearing is not None:
                 aim_yaw = self.last_hit_bearing
